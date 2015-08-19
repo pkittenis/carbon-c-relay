@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2014 Fabian Groffen
+ * Copyright 2013-2015 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,14 +20,17 @@
 
 #include <stdlib.h>
 
+#include "router.h"
+
 typedef struct _dispatcher dispatcher;
 
 void dispatch_check_rlimit_and_warn(void);
 int dispatch_addlistener(int sock);
+int dispatch_addlistener_udp(int sock);
 void dispatch_removelistener(int sock);
 int dispatch_addconnection(int sock);
 dispatcher *dispatch_new_listener(void);
-dispatcher *dispatch_new_connection(void);
+dispatcher *dispatch_new_connection(route *routes, char *allowed_chars);
 void dispatch_stop(dispatcher *d);
 void dispatch_shutdown(dispatcher *d);
 size_t dispatch_get_ticks(dispatcher *self);
@@ -35,5 +38,8 @@ size_t dispatch_get_metrics(dispatcher *self);
 char dispatch_busy(dispatcher *self);
 size_t dispatch_get_accepted_connections(void);
 size_t dispatch_get_closed_connections(void);
+void dispatch_schedulereload(dispatcher *d, route *r);
+char dispatch_reloadcomplete(dispatcher *d);
+
 
 #endif

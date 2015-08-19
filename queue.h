@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2014 Fabian Groffen
+ * Copyright 2013-2015 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,5 +30,6 @@ size_t queue_dequeue_vector(const char **ret, queue *q, size_t len);
 char queue_putback(queue *q, const char *p);
 size_t queue_len(queue *q);
 size_t queue_free(queue *q);
+size_t queue_size(queue *q);
 
 #endif

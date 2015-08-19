@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2014 Fabian Groffen
+ * Copyright 2013-2015 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,18 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <string.h>
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
+#include <assert.h>
+#if defined(_OPENMP)
+# include <omp.h>
+#endif
 
 #include "relay.h"
-#include "consistent-hash.h"
 #include "server.h"
 #include "router.h"
 #include "receptor.h"
@@ -33,8 +37,75 @@
 #include "collector.h"
 
 int keep_running = 1;
-char relay_hostname[128];
+char relay_hostname[256];
+enum rmode mode = NORMAL;
 
+static char *config = NULL;
+static int batchsize = 2500;
+static int queuesize = 25000;
+static dispatcher **workers = NULL;
+static char workercnt = 0;
+static cluster *clusters = NULL;
+static route *routes = NULL;
+static char *relay_logfile = NULL;
+static FILE *relay_stdout = NULL;
+static FILE *relay_stderr = NULL;
+static char relay_can_log = 0;
+
+
+/**
+ * Writes to the setup output stream, prefixed with a timestamp, and if
+ * the stream is not going to stdout or stderr, prefixed with MSG or
+ * ERR.
+ */
+int
+relaylog(enum logdst dest, const char *fmt, ...)
+{
+	va_list ap;
+	char prefix[64];
+	size_t len;
+	time_t now;
+	struct tm *tm_now;
+	FILE *dst = NULL;
+	char console = 0;
+	int ret;
+
+	switch (dest) {
+		case LOGOUT:
+			dst = relay_stdout;
+			if (dst == stdout)
+				console = 1;
+			break;
+		case LOGERR:
+			dst = relay_stderr;
+			if (dst == stderr)
+				console = 1;
+			break;
+	}
+	assert(dst != NULL);
+
+	/* briefly stall if we're swapping fds */
+	while (!relay_can_log)
+		usleep((100 + (rand() % 200)) * 1000);  /* 100ms - 300ms */
+
+	time(&now);
+	tm_now = localtime(&now);
+	len = strftime(prefix, sizeof(prefix), "[%Y-%m-%d %H:%M:%S]", tm_now);
+
+	if (!console)
+		len += snprintf(prefix + len, sizeof(prefix) - len, " (%s)", dest == LOGOUT ? "MSG" : "ERR");
+
+	fprintf(dst, "%s ", prefix);
+
+	va_start(ap, fmt);
+
+	ret = vfprintf(dst, fmt, ap);
+	fflush(dst);
+
+	va_end(ap);
+
+	return ret;
+}
 
 static void
 exit_handler(int sig)
@@ -53,31 +124,86 @@ exit_handler(int sig)
 			break;
 	}
 	if (keep_running) {
-		fprintf(stdout, "caught %s, terminating...\n", signal);
-		fflush(stdout);
+		logout("caught %s, terminating...\n", signal);
 	} else {
-		fprintf(stderr, "caught %s while already shutting down, "
+		logerr("caught %s while already shutting down, "
 				"forcing exit...\n", signal);
-		fflush(NULL);
 		exit(1);
 	}
 	keep_running = 0;
 }
 
-char *
-fmtnow(char nowbuf[24])
+static void
+hup_handler(int sig)
 {
-	time_t now;
-	struct tm *tm_now;
+	route *newroutes;
+	cluster *newclusters;
+	int id;
+	FILE *newfd;
 
-	time(&now);
-	tm_now = localtime(&now);
-	strftime(nowbuf, 24, "%Y-%m-%d %H:%M:%S", tm_now);
+	logout("caught SIGHUP...\n");
+	if (relay_stderr != stderr) {
+		/* try to re-open the file first, so we can still try and say
+		 * something if that fails */
+		if ((newfd = fopen(relay_logfile, "a")) == NULL) {
+			logerr("not reopening logfiles: can't open '%s': %s\n",
+					relay_logfile, strerror(errno));
+		} else {
+			logout("closing logfile\n");
+			relay_can_log = 0;
+			fclose(relay_stderr);
+			relay_stdout = newfd;
+			relay_stderr = newfd;
+			relay_can_log = 1;
+			logout("reopening logfile\n");
+		}
+	}
+	logout("reloading config from '%s'...\n", config);
 
-	return nowbuf;
+	if (router_readconfig(&newclusters, &newroutes,
+				config, queuesize, batchsize) == 0)
+	{
+		logerr("failed to read configuration '%s', aborting reload\n",
+				config);
+		return;
+	}
+	router_optimise(&newroutes);
+
+	logout("reloading worker");
+	for (id = 1; id < 1 + workercnt; id++)
+		dispatch_schedulereload(workers[id + 0], newroutes);
+	for (id = 1; id < 1 + workercnt; id++) {
+		while (!dispatch_reloadcomplete(workers[id + 0]))
+			usleep((100 + (rand() % 200)) * 1000);  /* 100ms - 300ms */
+		fprintf(relay_stdout, " %d", id + 1);
+		fflush(relay_stdout);
+	}
+	fprintf(relay_stdout, "\n");
+
+	logout("reloading collector\n");
+	collector_schedulereload(newclusters);
+	while (!collector_reloadcomplete())
+		usleep((100 + (rand() % 200)) * 1000);  /* 100ms - 300ms */
+
+	router_free(clusters, routes);
+
+	routes = newroutes;
+	clusters = newclusters;
+
+	logout("SIGHUP handler complete\n");
 }
 
-void
+static int
+get_cores(void)
+{
+#if defined(_OPENMP)
+	return omp_get_num_procs();
+#else
+	return 5;
+#endif
+}
+
+static void
 do_version(void)
 {
 	printf("carbon-c-relay v" VERSION " (" GIT_VERSION ")\n");
@@ -85,7 +211,7 @@ do_version(void)
 	exit(0);
 }
 
-void
+static void
 do_usage(int exitcode)
 {
 	printf("Usage: relay [-vdst] -f <config> [-p <port>] [-w <workers>] [-b <size>] [-q <size>]\n");
@@ -94,12 +220,18 @@ do_usage(int exitcode)
 	printf("  -v  print version and exit\n");
 	printf("  -f  read <config> for clusters and routes\n");
 	printf("  -p  listen on <port> for connections, defaults to 2003\n");
-	printf("  -w  user <workers> worker threads, defaults to 16\n");
+	printf("  -i  listen on <interface> for connections, defaults to all\n");
+	printf("  -l  write output to <file>, defaults to stdout/stderr\n");
+	printf("  -w  use <workers> worker threads, defaults to %d\n", get_cores());
 	printf("  -b  server send batch size, defaults to 2500\n");
 	printf("  -q  server queue size, defaults to 25000\n");
-	printf("  -d  debug mode: currently writes statistics to stdout\n");
-	printf("  -s  submission mode: write info about errors to stdout\n");
+	printf("  -S  statistics sending interval in seconds, defaults to 60\n");
+	printf("  -c  characters to allow next to [A-Za-z0-9], defaults to -_:#\n");
+	printf("  -d  debug mode: currently writes statistics to log, prints hash\n"
+	       "      ring contents and matching position in test mode (-t)\n");
+	printf("  -s  submission mode: write info about errors to log\n");
 	printf("  -t  config test mode: prints rule matches from input on stdin\n");
+	printf("  -H  hostname: override hostname (used in statistics)\n");
 
 	exit(exitcode);
 }
@@ -107,39 +239,54 @@ do_usage(int exitcode)
 int
 main(int argc, char * const argv[])
 {
-	int sock[] = {0, 0, 0};  /* IPv4, IPv6, UNIX */
-	int socklen = sizeof(sock) / sizeof(sock[0]);
+	int stream_sock[] = {0, 0, 0};  /* tcp4, tcp6, UNIX */
+	int stream_socklen = sizeof(stream_sock) / sizeof(stream_sock[0]);
+	int dgram_sock[] = {0, 0};  /* udp4, udp6 */
+	int dgram_socklen = sizeof(dgram_sock) / sizeof(dgram_sock[0]);
 	char id;
-	server **servers;
-	dispatcher **workers;
-	char workercnt = 0;
-	char *routes = NULL;
 	unsigned short listenport = 2003;
-	int batchsize = 2500;
-	int queuesize = 25000;
-	enum rmode mode = NORMAL;
 	int ch;
-	char nowbuf[24];
 	size_t numaggregators;
 	size_t numcomputes;
 	server *internal_submission;
+	char *listeninterface = NULL;
+	server **servers;
+	char *allowed_chars = NULL;
+	int i;
 
-	while ((ch = getopt(argc, argv, ":hvdstf:p:w:b:q:")) != -1) {
+	if (gethostname(relay_hostname, sizeof(relay_hostname)) < 0)
+		snprintf(relay_hostname, sizeof(relay_hostname), "127.0.0.1");
+
+	while ((ch = getopt(argc, argv, ":hvdstf:i:l:p:w:b:q:S:c:H:")) != -1) {
 		switch (ch) {
 			case 'v':
 				do_version();
 				break;
 			case 'd':
-				mode = DEBUG;
+				if (mode == TEST) {
+					mode = DEBUGTEST;
+				} else {
+					mode = DEBUG;
+				}
 				break;
 			case 's':
 				mode = SUBMISSION;
 				break;
 			case 't':
-				mode = TEST;
+				if (mode == DEBUG) {
+					mode = DEBUGTEST;
+				} else {
+					mode = TEST;
+				}
 				break;
 			case 'f':
-				routes = optarg;
+				config = optarg;
+				break;
+			case 'i':
+				listeninterface = optarg;
+				break;
+			case 'l':
+				relay_logfile = optarg;
 				break;
 			case 'p':
 				listenport = (unsigned short)atoi(optarg);
@@ -169,6 +316,20 @@ main(int argc, char * const argv[])
 					do_usage(1);
 				}
 				break;
+			case 'S':
+				collector_interval = atoi(optarg);
+				if (collector_interval <= 0) {
+					fprintf(stderr, "error: sending interval needs to be "
+							"a number >0\n");
+					do_usage(1);
+				}
+				break;
+			case 'c':
+				allowed_chars = optarg;
+				break;
+			case 'H':
+				snprintf(relay_hostname, sizeof(relay_hostname), "%s", optarg);
+				break;
 			case '?':
 			case ':':
 				do_usage(1);
@@ -179,193 +340,229 @@ main(int argc, char * const argv[])
 				break;
 		}
 	}
-	if (optind == 1 || routes == NULL)
+	if (optind == 1 || config == NULL)
 		do_usage(1);
 
-
-	if (gethostname(relay_hostname, sizeof(relay_hostname)) < 0)
-		snprintf(relay_hostname, sizeof(relay_hostname), "127.0.0.1");
 
 	/* seed randomiser for dispatcher and aggregator "splay" */
 	srand(time(NULL));
 
 	if (workercnt == 0)
-		workercnt = mode == SUBMISSION ? 2 : 16;
+		workercnt = mode == SUBMISSION ? 2 : get_cores();
 
-	fprintf(stdout, "[%s] starting carbon-c-relay v%s (%s)\n",
-		fmtnow(nowbuf), VERSION, GIT_VERSION);
-	fprintf(stdout, "configuration:\n");
-	fprintf(stdout, "    relay hostname = %s\n", relay_hostname);
-	fprintf(stdout, "    listen port = %u\n", listenport);
-	fprintf(stdout, "    workers = %d\n", workercnt);
-	fprintf(stdout, "    send batch size = %d\n", batchsize);
-	fprintf(stdout, "    server queue size = %d\n", queuesize);
-	if (mode == DEBUG)
-		fprintf(stdout, "    debug = true\n");
+	/* any_of failover maths need batchsize to be smaller than queuesize */
+	if (batchsize > queuesize) {
+		fprintf(stderr, "error: batchsize must be smaller than queuesize\n");
+		exit(-1);
+	}
+
+	if (relay_logfile != NULL && mode != TEST && mode != DEBUGTEST) {
+		FILE *f = fopen(relay_logfile, "a");
+		if (f == NULL) {
+			fprintf(stderr, "error: failed to open logfile '%s': %s\n",
+					relay_logfile, strerror(errno));
+			exit(-1);
+		}
+		relay_stdout = f;
+		relay_stderr = f;
+	} else {
+		relay_stdout = stdout;
+		relay_stderr = stderr;
+	}
+	relay_can_log = 1;
+
+	logout("starting carbon-c-relay v%s (%s), pid=%d\n",
+			VERSION, GIT_VERSION, getpid());
+	fprintf(relay_stdout, "configuration:\n");
+	fprintf(relay_stdout, "    relay hostname = %s\n", relay_hostname);
+	fprintf(relay_stdout, "    listen port = %u\n", listenport);
+	if (listeninterface != NULL)
+		fprintf(relay_stdout, "    listen interface = %s\n", listeninterface);
+	fprintf(relay_stdout, "    workers = %d\n", workercnt);
+	fprintf(relay_stdout, "    send batch size = %d\n", batchsize);
+	fprintf(relay_stdout, "    server queue size = %d\n", queuesize);
+	fprintf(relay_stdout, "    statistics submission interval = %ds\n",
+			collector_interval);
+	if (allowed_chars != NULL)
+		fprintf(relay_stdout, "    extra allowed characters = %s\n",
+				allowed_chars);
+	if (mode == DEBUG || mode == DEBUGTEST)
+		fprintf(relay_stdout, "    debug = true\n");
 	else if (mode == SUBMISSION)
-		fprintf(stdout, "    submission = true\n");
-	fprintf(stdout, "    routes configuration = %s\n", routes);
-	fprintf(stdout, "\n");
-	if (router_readconfig(routes, batchsize, queuesize) == 0) {
-		fprintf(stderr, "failed to read configuration '%s'\n", routes);
+		fprintf(relay_stdout, "    submission = true\n");
+	fprintf(relay_stdout, "    routes configuration = %s\n", config);
+	fprintf(relay_stdout, "\n");
+
+	if (router_readconfig(&clusters, &routes,
+				config, queuesize, batchsize) == 0)
+	{
+		logerr("failed to read configuration '%s'\n", config);
 		return 1;
 	}
-	router_optimise();
+	router_optimise(&routes);
+
 	numaggregators = aggregator_numaggregators();
 	numcomputes = aggregator_numcomputes();
+#define dbg (mode == DEBUG || mode == DEBUGTEST ? 2 : 0)
 	if (numaggregators > 10) {
-		fprintf(stdout, "parsed configuration follows:\n"
+		fprintf(relay_stdout, "parsed configuration follows:\n"
 				"(%zd aggregations with %zd computations omitted "
 				"for brevity)\n", numaggregators, numcomputes);
-		router_printconfig(stdout, 0);
+		router_printconfig(relay_stdout, 0 + dbg, clusters, routes);
 	} else {
-		fprintf(stdout, "parsed configuration follows:\n");
-		router_printconfig(stdout, 1);
+		fprintf(relay_stdout, "parsed configuration follows:\n");
+		router_printconfig(relay_stdout, 1 + dbg, clusters, routes);
 	}
-	fprintf(stdout, "\n");
+	fprintf(relay_stdout, "\n");
 
 	/* shortcut for rule testing mode */
-	if (mode == TEST) {
-		char metricbuf[8096];
+	if (mode == TEST || mode == DEBUGTEST) {
+		char metricbuf[METRIC_BUFSIZ];
 		char *p;
 
-		fflush(stdout);
+		fflush(relay_stdout);
 		while (fgets(metricbuf, sizeof(metricbuf), stdin) != NULL) {
 			if ((p = strchr(metricbuf, '\n')) != NULL)
 				*p = '\0';
-			router_test(metricbuf);
+			router_test(metricbuf, routes);
 		}
 
 		exit(0);
 	}
 
 	if (signal(SIGINT, exit_handler) == SIG_ERR) {
-		fprintf(stderr, "failed to create SIGINT handler: %s\n",
-				strerror(errno));
+		logerr("failed to create SIGINT handler: %s\n", strerror(errno));
 		return 1;
 	}
 	if (signal(SIGTERM, exit_handler) == SIG_ERR) {
-		fprintf(stderr, "failed to create SIGTERM handler: %s\n",
-				strerror(errno));
+		logerr("failed to create SIGTERM handler: %s\n", strerror(errno));
 		return 1;
 	}
 	if (signal(SIGQUIT, exit_handler) == SIG_ERR) {
-		fprintf(stderr, "failed to create SIGQUIT handler: %s\n",
-				strerror(errno));
+		logerr("failed to create SIGQUIT handler: %s\n", strerror(errno));
+		return 1;
+	}
+	if (signal(SIGHUP, hup_handler) == SIG_ERR) {
+		logerr("failed to create SIGHUP handler: %s\n", strerror(errno));
 		return 1;
 	}
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-		fprintf(stderr, "failed to ignore SIGPIPE: %s\n",
-				strerror(errno));
+		logerr("failed to ignore SIGPIPE: %s\n", strerror(errno));
 		return 1;
 	}
 
 	workers = malloc(sizeof(dispatcher *) * (1 + workercnt + 1));
 	if (workers == NULL) {
-		fprintf(stderr, "failed to allocate memory for workers\n");
+		logerr("failed to allocate memory for workers\n");
 		return 1;
 	}
 
-	if (bindlisten(sock, &socklen, listenport) < 0) {
-		fprintf(stderr, "failed to bind on port %d: %s\n",
+	if (bindlisten(stream_sock, &stream_socklen,
+				dgram_sock, &dgram_socklen,
+				listeninterface, listenport) < 0) {
+		logerr("failed to bind on port %s:%d: %s\n",
+				listeninterface == NULL ? "" : listeninterface,
 				listenport, strerror(errno));
 		return -1;
 	}
-	for (ch = 0; ch < socklen; ch++) {
-		if (dispatch_addlistener(sock[ch]) != 0) {
-			fprintf(stderr, "failed to add listener\n");
+	for (ch = 0; ch < stream_socklen; ch++) {
+		if (dispatch_addlistener(stream_sock[ch]) != 0) {
+			logerr("failed to add listener\n");
 			return -1;
 		}
 	}
-	fprintf(stdout, "listening on port %u\n", listenport);
+	for (ch = 0; ch < dgram_socklen; ch++) {
+		if (dispatch_addlistener_udp(dgram_sock[ch]) != 0) {
+			logerr("failed to listen to datagram socket\n");
+			return -1;
+		}
+	}
 	if ((workers[0] = dispatch_new_listener()) == NULL)
-		fprintf(stderr, "failed to add listener\n");
+		logerr("failed to add listener\n");
 
-	fprintf(stdout, "starting %d workers\n", workercnt);
+	if (allowed_chars == NULL)
+		allowed_chars = "-_:#";
+	logout("starting %d workers\n", workercnt);
 	for (id = 1; id < 1 + workercnt; id++) {
-		workers[id + 0] = dispatch_new_connection();
+		workers[id + 0] = dispatch_new_connection(routes, allowed_chars);
 		if (workers[id + 0] == NULL) {
-			fprintf(stderr, "failed to add worker %d\n", id);
+			logerr("failed to add worker %d\n", id);
 			break;
 		}
 	}
 	workers[id + 0] = NULL;
 	if (id < 1 + workercnt) {
-		fprintf(stderr, "shutting down due to errors\n");
+		logerr("shutting down due to errors\n");
 		keep_running = 0;
 	}
 
-	servers = server_get_servers();
-
 	/* server used for delivering metrics produced inside the relay,
 	 * that is collector (statistics) and aggregator (aggregations) */
-	if ((internal_submission = server_new("internal", listenport,
-					3000 + (numcomputes * 3), batchsize)) == NULL)
+	if ((internal_submission = server_new("internal", listenport, CON_PIPE,
+					NULL, 3000 + (numcomputes * 3), batchsize)) == NULL)
 	{
-		fprintf(stderr, "failed to create internal submission queue, shutting down\n");
+		logerr("failed to create internal submission queue, shutting down\n");
 		keep_running = 0;
 	}
 
 	if (numaggregators > 0) {
-		fprintf(stdout, "starting aggregator\n");
+		logout("starting aggregator\n");
 		if (!aggregator_start(internal_submission)) {
-			fprintf(stderr, "shutting down due to failure to start aggregator\n");
+			logerr("shutting down due to failure to start aggregator\n");
 			keep_running = 0;
 		}
 	}
 
-	fprintf(stdout, "starting statistics collector\n");
-	collector_start((void **)&workers[1], (void **)servers, mode,
-			internal_submission);
+	logout("starting statistics collector\n");
+	collector_start(&workers[1], clusters, internal_submission);
 
-	fflush(stdout);  /* ensure all info stuff up here is out of the door */
+	logout("startup sequence complete\n");
 
 	/* workers do the work, just wait */
 	while (keep_running)
 		sleep(1);
 
-	fprintf(stdout, "[%s] shutting down...\n", fmtnow(nowbuf));
-	fflush(stdout);
+	logout("shutting down...\n");
 	/* make sure we don't accept anything new anymore */
-	for (ch = 0; ch < socklen; ch++)
-		dispatch_removelistener(sock[ch]);
+	for (ch = 0; ch < stream_socklen; ch++)
+		dispatch_removelistener(stream_sock[ch]);
 	destroy_usock(listenport);
-	fprintf(stdout, "[%s] listener for port %u closed\n",
-			fmtnow(nowbuf), listenport);
-	fflush(stdout);
+	logout("listeners for port %u closed\n", listenport);
 	/* since workers will be freed, stop querying the structures */
 	collector_stop();
-	fprintf(stdout, "[%s] collector stopped\n", fmtnow(nowbuf));
-	fflush(stdout);
+	logout("collector stopped\n");
 	if (numaggregators > 0) {
 		aggregator_stop();
-		fprintf(stdout, "[%s] aggregator stopped\n", fmtnow(nowbuf));
-		fflush(stdout);
+		logout("aggregator stopped\n");
 	}
 	server_shutdown(internal_submission);
 	/* give a little time for whatever the collector/aggregator wrote,
 	 * to be delivered by the dispatchers */
 	usleep(500 * 1000);  /* 500ms */
 	/* make sure we don't write to our servers any more */
-	fprintf(stdout, "[%s] stopped worker", fmtnow(nowbuf));
-	fflush(stdout);
+	logout("stopped worker");
 	for (id = 0; id < 1 + workercnt; id++)
 		dispatch_stop(workers[id + 0]);
 	for (id = 0; id < 1 + workercnt; id++) {
 		dispatch_shutdown(workers[id + 0]);
-		fprintf(stdout, " %d", id + 1);
-		fflush(stdout);
+		fprintf(relay_stdout, " %d", id + 1);
+		fflush(relay_stdout);
 	}
-	fprintf(stdout, " (%s)\n", fmtnow(nowbuf));
-	fflush(stdout);
+	fprintf(relay_stdout, "\n");
 	router_shutdown();
-	server_shutdown_all();
-	fprintf(stdout, "[%s] routing stopped\n", fmtnow(nowbuf));
-	fflush(stdout);
+	servers = router_getservers(clusters);
+	logout("stopped server");
+	for (i = 0; servers[i] != NULL; i++)
+		server_stop(servers[i]);
+	for (i = 0; servers[i] != NULL; i++) {
+		server_shutdown(servers[i]);
+		fprintf(relay_stdout, " %d", i + 1);
+		fflush(relay_stdout);
+	}
+	fprintf(relay_stdout, "\n");
+	logout("routing stopped\n");
 
-	fflush(stderr);  /* ensure all of our termination messages are out */
-
+	router_free(clusters, routes);
 	free(workers);
-	free(servers);
 	return 0;
 }

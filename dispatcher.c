@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2014 Fabian Groffen
+ * Copyright 2013-2015 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,27 +31,27 @@
 #include "router.h"
 #include "server.h"
 #include "collector.h"
+#include "dispatcher.h"
 
 enum conntype {
 	LISTENER,
 	CONNECTION
 };
 
-#define CONN_READBUF_SIZE  8096
-#define CONN_DESTS_SIZE    32
 typedef struct _connection {
 	int sock;
 	char takenby;   /* -2: being setup, -1: free, 0: not taken, >0: tid */
-	char buf[CONN_READBUF_SIZE];
+	char buf[METRIC_BUFSIZ];
 	int buflen;
 	char needmore:1;
-	char metric[CONN_READBUF_SIZE];
-	server *dests[CONN_DESTS_SIZE];
+	char noexpire:1;
+	char metric[METRIC_BUFSIZ];
+	destination dests[CONN_DESTS_SIZE];
 	size_t destlen;
 	time_t wait;
 } connection;
 
-typedef struct _dispatcher {
+struct _dispatcher {
 	pthread_t tid;
 	enum conntype type;
 	char id;
@@ -59,7 +59,11 @@ typedef struct _dispatcher {
 	size_t ticks;
 	enum { RUNNING, SLEEPING } state;
 	char keep_running:1;
-} dispatcher;
+	route *routes;
+	route *pending_routes;
+	char route_refresh_pending:1;
+	char *allowed_chars;
+};
 
 static connection *listeners[32];       /* hopefully enough */
 static connection *connections = NULL;
@@ -86,7 +90,7 @@ dispatch_check_rlimit_and_warn(void)
 		if (getrlimit(RLIMIT_NOFILE, &ofiles) < 0)
 			ofiles.rlim_max = 0;
 		if (ofiles.rlim_max != RLIM_INFINITY && ofiles.rlim_max > 0)
-			fprintf(stderr, "process configured maximum connections = %d, "
+			logerr("process configured maximum connections = %d, "
 					"consider raising max open files/max descriptor limit\n",
 					(int)ofiles.rlim_max);
 	}
@@ -113,11 +117,10 @@ dispatch_addlistener(int sock)
 		if (__sync_bool_compare_and_swap(&(listeners[c]), NULL, newconn))
 			break;
 	if (c == sizeof(listeners) / sizeof(connection *)) {
-		char nowbuf[24];
 		free(newconn);
-		fprintf(stderr, "[%s] cannot add new listener: "
+		logerr("cannot add new listener: "
 				"no more free listener slots (max = %zd)\n",
-				fmtnow(nowbuf), sizeof(listeners) / sizeof(connection *));
+				sizeof(listeners) / sizeof(connection *));
 		return 1;
 	}
 
@@ -136,7 +139,7 @@ dispatch_removelistener(int sock)
 			break;
 	if (c == sizeof(listeners) / sizeof(connection *)) {
 		/* not found?!? */
-		fprintf(stderr, "dispatch: cannot find listener!\n");
+		logerr("dispatch: cannot find listener!\n");
 		return;
 	}
 	/* make this connection no longer visible */
@@ -154,6 +157,7 @@ dispatch_removelistener(int sock)
 /**
  * Adds a connection socket to the chain of connections.
  * Connection sockets are those which need to be read from.
+ * Returns the connection id, or -1 if a failure occurred.
  */
 int
 dispatch_addconnection(int sock)
@@ -167,7 +171,6 @@ dispatch_addconnection(int sock)
 	pthread_rwlock_unlock(&connectionslock);
 
 	if (c == connectionslen) {
-		char nowbuf[24];
 		connection *newlst;
 
 		pthread_rwlock_wrlock(&connectionslock);
@@ -179,12 +182,12 @@ dispatch_addconnection(int sock)
 		newlst = realloc(connections,
 				sizeof(connection) * (connectionslen + CONNGROWSZ));
 		if (newlst == NULL) {
-			fprintf(stderr, "[%s] cannot add new connection: "
+			logerr("cannot add new connection: "
 					"out of memory allocating more slots (max = %zd)\n",
-					fmtnow(nowbuf), connectionslen);
+					connectionslen);
 
 			pthread_rwlock_unlock(&connectionslock);
-			return 1;
+			return -1;
 		}
 
 		memset(&newlst[connectionslen], '\0',
@@ -203,13 +206,35 @@ dispatch_addconnection(int sock)
 	connections[c].sock = sock;
 	connections[c].buflen = 0;
 	connections[c].needmore = 0;
+	connections[c].noexpire = 0;
 	connections[c].destlen = 0;
 	connections[c].wait = 0;
 	connections[c].takenby = 0;  /* now dispatchers will pick this one up */
 	acceptedconnections++;
 
+	return c;
+}
+
+/**
+ * Adds a pseudo-listener for datagram (UDP) sockets, which is pseudo,
+ * for in fact it adds a new connection, but makes sure that connection
+ * won't be closed after being idle, and won't count that connection as
+ * an incoming connection either.
+ */
+int
+dispatch_addlistener_udp(int sock)
+{
+	int conn = dispatch_addconnection(sock);
+	
+	if (conn == -1)
+		return 1;
+
+	connections[conn].noexpire = 1;
+	acceptedconnections--;
+
 	return 0;
 }
+
 
 inline static char
 dispatch_process_dests(connection *conn, dispatcher *self)
@@ -219,19 +244,18 @@ dispatch_process_dests(connection *conn, dispatcher *self)
 
 	if (conn->destlen > 0) {
 		for (i = 0; i < conn->destlen; i++) {
-			if (server_send(conn->dests[i], conn->metric, force) == 0)
+			if (server_send(conn->dests[i].dest, conn->dests[i].metric, force) == 0)
 				break;
 		}
 		if (i != conn->destlen) {
 			conn->destlen -= i;
 			memmove(&conn->dests[0], &conn->dests[i],
-					(sizeof(server *) * conn->destlen));
+					(sizeof(destination) * conn->destlen));
 			return 0;
 		} else {
 			/* finally "complete" this metric */
 			conn->destlen = 0;
 			conn->wait = 0;
-			self->metrics++;
 		}
 	}
 
@@ -240,13 +264,29 @@ dispatch_process_dests(connection *conn, dispatcher *self)
 
 #define IDLE_DISCONNECT_TIME  (10 * 60)  /* 10 minutes */
 /**
- * Look at conn and see if works needs to be done.  If so, do it.
+ * Look at conn and see if works needs to be done.  If so, do it.  This
+ * function operates on an (exclusive) lock on the connection it serves.
+ * Schematically, what this function does is like this:
+ *
+ *   read (partial) data  <----
+ *         |                   |
+ *         v                   |
+ *   split and clean metrics   |
+ *         |                   |
+ *         v                   |
+ *   route metrics             | feedback loop
+ *         |                   | (stall client)
+ *         v                   |
+ *   send 1st attempt          |
+ *         \                   |
+ *          v*                 | * this is optional, but if a server's
+ *   retry send (<1s)  --------    queue is full, the client is stalled
+ *      block reads
  */
 static int
 dispatch_connection(connection *conn, dispatcher *self)
 {
 	char *p, *q, *firstspace, *lastnl;
-	char metric_path[sizeof(conn->buf)];
 	int len;
 	struct timeval start, stop;
 
@@ -284,39 +324,7 @@ dispatch_connection(connection *conn, dispatcher *self)
 		firstspace = NULL;
 		lastnl = NULL;
 		for (p = conn->buf; p - conn->buf < conn->buflen; p++) {
-			if ((*p >= 'a' && *p <= 'z') ||
-					(*p >= 'A' && *p <= 'Z') ||
-					(*p >= '0' && *p <= '9') ||
-					*p == '-' || *p == '_' || *p == ':')
-			{
-				/* copy char */
-				*q++ = *p;
-			} else if (*p == ' ' || *p == '\t' || *p == '.') {
-				/* separator */
-				if (*p == '\t')
-					*p = ' ';
-				if (*p == ' ' && firstspace == NULL) {
-					if (q == conn->metric) {
-						/* make sure we skip this on next iteration to
-						 * avoid an infinite loop */
-						lastnl = p;
-						continue;
-					}
-					if (*(q - 1) == '.')
-						q--;  /* strip trailing separator */
-					firstspace = q;
-					*q++ = '\0';
-				} else {
-					/* metric_path separator or space,
-					 * - duplicate elimination
-					 * - don't start with separator/space */
-					if (
-							q != conn->metric &&
-							*(q - 1) != *p &&
-							(q - 1) != firstspace)
-						*q++ = *p;
-				}
-			} else if (*p == '\n' || *p == '\r') {
+			if (*p == '\n' || *p == '\r') {
 				/* end of metric */
 				lastnl = p;
 
@@ -327,18 +335,14 @@ dispatch_connection(connection *conn, dispatcher *self)
 					continue;
 				}
 
+				self->metrics++;
 				*q++ = '\n';
 				*q = '\0';  /* can do this because we substract one from buf */
 
-				/* copy metric_path alone (up to firstspace) */
-				memcpy(metric_path, conn->metric,
-						firstspace + 1 - conn->metric);
-				*firstspace = ' ';
-
 				/* perform routing of this metric */
 				conn->destlen =
-					router_route(conn->dests, sizeof(conn->dests),
-							metric_path, conn->metric);
+					router_route(conn->dests, CONN_DESTS_SIZE,
+							conn->metric, firstspace, self->routes);
 
 				/* restart building new one from the start */
 				q = conn->metric;
@@ -348,6 +352,36 @@ dispatch_connection(connection *conn, dispatcher *self)
 				/* send the metric to where it is supposed to go */
 				if (dispatch_process_dests(conn, self) == 0)
 					break;
+			} else if (*p == ' ' || *p == '\t' || *p == '.') {
+				/* separator */
+				if (q == conn->metric) {
+					/* make sure we skip this on next iteration to
+					 * avoid an infinite loop, issues #8 and #51 */
+					lastnl = p;
+					continue;
+				}
+				if (*p == '\t')
+					*p = ' ';
+				if (*p == ' ' && firstspace == NULL) {
+					if (*(q - 1) == '.')
+						q--;  /* strip trailing separator */
+					firstspace = q;
+					*q++ = ' ';
+				} else {
+					/* metric_path separator or space,
+					 * - duplicate elimination
+					 * - don't start with separator/space */
+					if (*(q - 1) != *p && (q - 1) != firstspace)
+						*q++ = *p;
+				}
+			} else if (firstspace != NULL ||
+					(*p >= 'a' && *p <= 'z') ||
+					(*p >= 'A' && *p <= 'Z') ||
+					(*p >= '0' && *p <= '9') ||
+					strchr(self->allowed_chars, *p))
+			{
+				/* copy char */
+				*q++ = *p;
 			} else {
 				/* something barf, replace by underscore */
 				*q++ = '_';
@@ -371,7 +405,9 @@ dispatch_connection(connection *conn, dispatcher *self)
 			conn->wait = time(NULL);
 			conn->takenby = 0;
 			return 0;
-		} else if (time(NULL) - conn->wait > IDLE_DISCONNECT_TIME) {
+		} else if (!conn->noexpire &&
+				time(NULL) - conn->wait > IDLE_DISCONNECT_TIME)
+		{
 			/* force close connection below */
 			len = 0;
 		} else {
@@ -385,13 +421,22 @@ dispatch_connection(connection *conn, dispatcher *self)
 		 * size argument is 0) -> this is good, because we can't do much
 		 * with such client */
 
-		closedconnections++;
-		close(conn->sock);
+		if (conn->noexpire) {
+			/* reset buffer only (UDP) and move on */
+			conn->needmore = 1;
+			conn->buflen = 0;
+			conn->takenby = 0;
 
-		/* flag this connection as no longer in use */
-		conn->takenby = -1;
+			return 0;
+		} else {
+			closedconnections++;
+			close(conn->sock);
 
-		return 0;
+			/* flag this connection as no longer in use */
+			conn->takenby = -1;
+
+			return 0;
+		}
 	}
 
 	/* "release" this connection again */
@@ -444,14 +489,13 @@ dispatch_runner(void *arg)
 
 						if ((client = accept(conn->sock, &addr, &addrlen)) < 0)
 						{
-							char nowbuf[24];
-							fprintf(stderr, "[%s] dispatch: failed to "
+							logerr("dispatch: failed to "
 									"accept() new connection: %s\n",
-									fmtnow(nowbuf), strerror(errno));
+									strerror(errno));
 							dispatch_check_rlimit_and_warn();
 							continue;
 						}
-						if (dispatch_addconnection(client) != 0) {
+						if (dispatch_addconnection(client) == -1) {
 							close(client);
 							continue;
 						}
@@ -462,6 +506,12 @@ dispatch_runner(void *arg)
 	} else if (self->type == CONNECTION) {
 		while (self->keep_running) {
 			work = 0;
+			if (self->route_refresh_pending) {
+				self->routes = self->pending_routes;
+				self->pending_routes = NULL;
+				self->route_refresh_pending = 0;
+			}
+
 			pthread_rwlock_rdlock(&connectionslock);
 			for (c = 0; c < connectionslen; c++) {
 				conn = &(connections[c]);
@@ -479,7 +529,7 @@ dispatch_runner(void *arg)
 				usleep((100 + (rand() % 200)) * 1000);  /* 100ms - 300ms */
 		}
 	} else {
-		fprintf(stderr, "huh? unknown self type!\n");
+		logerr("huh? unknown self type!\n");
 	}
 
 	return NULL;
@@ -490,7 +540,7 @@ dispatch_runner(void *arg)
  * Returns its handle.
  */
 static dispatcher *
-dispatch_new(char id, enum conntype type)
+dispatch_new(char id, enum conntype type, route *routes, char *allowed_chars)
 {
 	dispatcher *ret = malloc(sizeof(dispatcher));
 
@@ -504,6 +554,9 @@ dispatch_new(char id, enum conntype type)
 		free(ret);
 		return NULL;
 	}
+	ret->routes = routes;
+	ret->route_refresh_pending = 0;
+	ret->allowed_chars = allowed_chars;
 
 	return ret;
 }
@@ -517,8 +570,8 @@ static char globalid = 0;
 dispatcher *
 dispatch_new_listener(void)
 {
-	char id = __sync_fetch_and_add(&globalid, 1);
-	return dispatch_new(id, LISTENER);
+	char id = globalid++;
+	return dispatch_new(id, LISTENER, NULL, NULL);
 }
 
 /**
@@ -526,10 +579,10 @@ dispatch_new_listener(void)
  * existing connections.
  */
 dispatcher *
-dispatch_new_connection(void)
+dispatch_new_connection(route *routes, char *allowed_chars)
 {
-	char id = __sync_fetch_and_add(&globalid, 1);
-	return dispatch_new(id, CONNECTION);
+	char id = globalid++;
+	return dispatch_new(id, CONNECTION, routes, allowed_chars);
 }
 
 /**
@@ -551,6 +604,27 @@ dispatch_shutdown(dispatcher *d)
 	dispatch_stop(d);
 	pthread_join(d->tid, NULL);
 	free(d);
+}
+
+/**
+ * Schedules routes r to be put in place for the current routes.  The
+ * replacement is performed at the next cycle of the dispatcher.
+ */
+inline void
+dispatch_schedulereload(dispatcher *d, route *r)
+{
+	d->pending_routes = r;
+	d->route_refresh_pending = 1;
+}
+
+/**
+ * Returns true if the routes scheduled to be reloaded by a call to
+ * dispatch_schedulereload() have been activated.
+ */
+inline char
+dispatch_reloadcomplete(dispatcher *d)
+{
+	return d->route_refresh_pending == 0;
 }
 
 /**

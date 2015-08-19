@@ -1,4 +1,4 @@
-# Copyright 2013-2014 Fabian Groffen
+# Copyright 2013-2015 Fabian Groffen
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,21 +14,26 @@
 
 
 CFLAGS ?= -O2 -Wall
+# if your compiler doesn't support OpenMP, comment out this line, or
+# define OPENMP_FLAGS to be empty
+OPENMP_FLAGS ?= -fopenmp
+override CC += $(OPENMP_FLAGS)
 
 GIT_VERSION := $(shell git describe --abbrev=6 --dirty --always || date +%F)
 GVCFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
 
-override CFLAGS += $(GVCFLAGS) `pkg-config openssl --cflags` -pthread
+override CFLAGS += $(GVCFLAGS) -pthread
 
 SOCKET_LIBS =
 ifeq ($(shell uname), SunOS)
 SOCKET_LIBS += -lsocket  -lnsl
 endif
 
-override LIBS += `pkg-config openssl --libs` $(SOCKET_LIBS) -pthread
+override LIBS += $(SOCKET_LIBS) -pthread
 
 OBJS = \
 	relay.o \
+	md5.o \
 	consistent-hash.o \
 	receptor.o \
 	dispatcher.o \

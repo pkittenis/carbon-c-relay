@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2014 Fabian Groffen
+ * Copyright 2013-2015 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,10 @@
 #ifndef CONSISTENT_HASH_H
 #define CONSISTENT_HASH_H 1
 
+#include <stdio.h>
+
 #include "server.h"
+#include "router.h"
 
 #ifndef CH_RING
 #define CH_RING void
@@ -29,9 +32,13 @@ typedef enum { CARBON, FNV1a } ch_type;
 ch_ring *ch_new(ch_type type);
 ch_ring *ch_addnode(ch_ring *ring, server *s);
 void ch_get_nodes(
-		server *ret[],
+		destination ret[],
 		ch_ring *ring,
 		const char replcnt,
-		const char *metric);
+		const char *metric,
+		const char *firstspace);
+void ch_printhashring(ch_ring *ring, FILE *out);
+unsigned short ch_gethashpos(ch_ring *ring, const char *key, const char *end);
+void ch_free(ch_ring *ring);
 
 #endif

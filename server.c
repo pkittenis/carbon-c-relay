@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2014 Fabian Groffen
+ * Copyright 2013-2015 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/resource.h>
@@ -32,34 +33,30 @@
 #include "queue.h"
 #include "dispatcher.h"
 #include "collector.h"
+#include "server.h"
 
-enum servertype {
-	ORIGIN,
-	INTERNAL
-};
-
-typedef struct _server {
+struct _server {
 	const char *ip;
 	unsigned short port;
+	char *instance;
 	struct addrinfo *saddr;
 	int fd;
 	queue *queue;
 	size_t bsize;
 	const char **batch;
-	enum servertype type;
+	serv_ctype ctype;
 	pthread_t tid;
 	struct _server **secondaries;
 	size_t secondariescnt;
-	char failure:6;
+	char failover:1;
+	char failure:5;
 	char running:1;
 	char keep_running:1;
 	size_t metrics;
 	size_t dropped;
+	size_t stalls;
 	size_t ticks;
-	struct _server *next;
-} server;
-
-static server *servers = NULL;
+};
 
 
 /**
@@ -79,7 +76,6 @@ server_queuereader(void *d)
 	const char **metric = self->batch;
 	struct timeval start, stop;
 	struct timeval timeout;
-	char nowbuf[24];
 	queue *queue;
 	char idle = 0;
 
@@ -87,18 +83,18 @@ server_queuereader(void *d)
 	self->metrics = 0;
 	self->ticks = 0;
 
-	timeout.tv_sec = 0;
-
 #define FAIL_WAIT_TIME   6  /* 6 * 250ms = 1.5s */
-#define DISCONNECT_WAIT_TIME   12  /* 8 * 250ms = 3s */
+#define DISCONNECT_WAIT_TIME   12  /* 12 * 250ms = 3s */
 #define LEN_CRITICAL(Q)  (queue_free(Q) < self->bsize)
 	self->running = 1;
 	while (1) {
 		if (queue_len(self->queue) == 0) {
-			/* if we're idling, close the connection, this allows us
+			/* if we're idling, close the TCP connection, this allows us
 			 * to reduce connections, while keeping the connection alive
 			 * if we're writing a lot */
-			if (self->fd >= 0 && idle++ > DISCONNECT_WAIT_TIME) {
+			if (self->ctype == CON_TCP && self->fd >= 0 &&
+					idle++ > DISCONNECT_WAIT_TIME)
+			{
 				close(self->fd);
 				self->fd = -1;
 			}
@@ -112,7 +108,8 @@ server_queuereader(void *d)
 				/* it makes no sense to try and do something, so skip */
 				continue;
 		} else if (self->secondariescnt > 0 &&
-				(self->failure >= FAIL_WAIT_TIME || LEN_CRITICAL(self->queue)))
+				(self->failure >= FAIL_WAIT_TIME ||
+				 (!self->failover && LEN_CRITICAL(self->queue))))
 		{
 			size_t i;
 			/* offload data from our queue to our secondaries
@@ -131,7 +128,7 @@ server_queuereader(void *d)
 				if (self->secondaries[i]->failure)
 					continue;
 				queue = self->secondaries[i]->queue;
-				if (LEN_CRITICAL(queue)) {
+				if (!self->failover && LEN_CRITICAL(queue)) {
 					queue = NULL;
 					continue;
 				}
@@ -152,7 +149,8 @@ server_queuereader(void *d)
 						break;
 			}
 			for (; *metric != NULL; metric++) {
-				fprintf(stderr, "dropping metric: %s", *metric);
+				if (mode == DEBUG)
+					logerr("dropping metric: %s", *metric);
 				free((char *)*metric);
 				self->dropped++;
 			}
@@ -178,17 +176,49 @@ server_queuereader(void *d)
 
 		/* try to connect */
 		if (self->fd < 0) {
-			if (self->type == INTERNAL) {
+			if (self->ctype == CON_PIPE) {
 				int intconn[2];
 				if (pipe(intconn) < 0) {
 					if (!self->failure)
-						fprintf(stderr, "[%s] failed to create pipe: %s\n",
-								fmtnow(nowbuf), strerror(errno));
+						logerr("failed to create pipe: %s\n", strerror(errno));
 					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
 				dispatch_addconnection(intconn[0]);
 				self->fd = intconn[1];
+			} else if (self->ctype == CON_UDP) {
+				if ((self->fd = socket(self->saddr->ai_family,
+								self->saddr->ai_socktype,
+								self->saddr->ai_protocol)) < 0)
+				{
+					if (!self->failure)
+						logerr("failed to create udp socket: %s\n",
+								strerror(errno));
+					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
+					continue;
+				}
+				if (connect(self->fd,
+						self->saddr->ai_addr, self->saddr->ai_addrlen) < 0)
+				{
+					if (!self->failure)
+						logerr("failed to connect udp socket: %s\n",
+								strerror(errno));
+					close(self->fd);
+					self->fd = -1;
+					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
+					continue;
+				}
+			} else if (self->ctype == CON_FILE) {
+				if ((self->fd = open(self->ip,
+								O_WRONLY | O_APPEND | O_CREAT,
+								S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) < 0)
+				{
+					if (!self->failure)
+						logerr("failed to open file '%s': %s\n",
+								self->ip, strerror(errno));
+					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
+					continue;
+				}
 			} else {
 				int ret;
 				int args;
@@ -198,8 +228,8 @@ server_queuereader(void *d)
 								self->saddr->ai_protocol)) < 0)
 				{
 					if (!self->failure)
-						fprintf(stderr, "[%s] failed to create socket: %s\n",
-								fmtnow(nowbuf), strerror(errno));
+						logerr("failed to create socket: %s\n",
+								strerror(errno));
 					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
@@ -217,25 +247,24 @@ server_queuereader(void *d)
 					fd_set fds;
 					FD_ZERO(&fds);
 					FD_SET(self->fd, &fds);
+					timeout.tv_sec = 0;
 					timeout.tv_usec = (600 + (rand() % 100)) * 1000;
 					ret = select(self->fd + 1, NULL, &fds, NULL, &timeout);
 					if (ret == 0) {
 						/* time limit expired */
 						if (!self->failure)
-							fprintf(stderr, "[%s] failed to connect() to "
+							logerr("failed to connect() to "
 									"%s:%u: Operation timed out\n",
-									fmtnow(nowbuf), self->ip, self->port);
+									self->ip, self->port);
 						close(self->fd);
 						self->fd = -1;
 						self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 						continue;
 					} else if (ret < 0) {
-						/* some error occurred */
+						/* some select error occurred */
 						if (!self->failure)
-							fprintf(stderr, "[%s] failed to connect() to "
-									"%s:%u: %s\n",
-									fmtnow(nowbuf), self->ip, self->port,
-									strerror(errno));
+							logerr("failed to select() for %s:%u: %s\n",
+									self->ip, self->port, strerror(errno));
 						close(self->fd);
 						self->fd = -1;
 						self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
@@ -245,13 +274,22 @@ server_queuereader(void *d)
 						socklen_t serrlen = sizeof(serr);
 						if (getsockopt(self->fd, SOL_SOCKET, SO_ERROR,
 									(void *)(&serr), &serrlen) < 0)
-							serr = errno;
-						if (serr != 0) {
+						{
 							if (!self->failure)
-								fprintf(stderr, "[%s] failed to connect() to "
-										"%s:%u: %s\n",
-										fmtnow(nowbuf), self->ip, self->port,
-										strerror(serr));
+								logerr("failed to getsockopt() for %s:%u: %s\n",
+										self->ip, self->port, strerror(errno));
+							close(self->fd);
+							self->fd = -1;
+							self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
+							continue;
+						}
+						if (serr != 0) {
+							if (!self->failure) {
+								logerr("failed to connect() to %s:%u: %s "
+										"(after select())\n",
+										self->ip, self->port, strerror(serr));
+								dispatch_check_rlimit_and_warn();
+							}
 							close(self->fd);
 							self->fd = -1;
 							self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
@@ -260,10 +298,8 @@ server_queuereader(void *d)
 					}
 				} else if (ret < 0) {
 					if (!self->failure) {
-						fprintf(stderr, "[%s] failed to connect() to "
-								"%s:%u: %s\n",
-								fmtnow(nowbuf), self->ip, self->port,
-								strerror(errno));
+						logerr("failed to connect() to %s:%u: %s\n",
+								self->ip, self->port, strerror(errno));
 						dispatch_check_rlimit_and_warn();
 					}
 					close(self->fd);
@@ -277,6 +313,7 @@ server_queuereader(void *d)
 			}
 
 			/* ensure we will break out of connections being stuck */
+			timeout.tv_sec = 0;
 			timeout.tv_usec = (600 + (rand() % 100)) * 1000;
 			setsockopt(self->fd, SOL_SOCKET, SO_SNDTIMEO,
 					&timeout, sizeof(timeout));
@@ -293,7 +330,7 @@ server_queuereader(void *d)
 		if (len != 0 && !self->keep_running) {
 			/* be noisy during shutdown so we can track any slowing down
 			 * servers, possibly preventing us to shut down */
-			fprintf(stderr, "shutting down %s:%u: waiting for %zd metrics\n",
+			logerr("shutting down %s:%u: waiting for %zd metrics\n",
 					self->ip, self->port, len + queue_len(self->queue));
 		}
 
@@ -301,11 +338,10 @@ server_queuereader(void *d)
 			/* if we don't have anything to send, we have at least a
 			 * connection succeed, so assume the server is up again,
 			 * this is in particular important for recovering this
-			 * node by probes, done every FAIL_WAIT_TIME, to avoid
-			 * starvation of this server since its queue is possibly
-			 * being offloaded to secondaries */
-			fprintf(stderr, "[%s] server %s:%u: OK after probe\n",
-					fmtnow(nowbuf), self->ip, self->port);
+			 * node by probes, to avoid starvation of this server since
+			 * its queue is possibly being offloaded to secondaries */
+			if (self->ctype != CON_UDP)
+				logerr("server %s:%u: OK after probe\n", self->ip, self->port);
 			self->failure = 0;
 		}
 
@@ -317,25 +353,27 @@ server_queuereader(void *d)
 				 * partially sent data is an error for us, since we use
 				 * blocking sockets, and hence partial sent is
 				 * indication of a failure */
-				fprintf(stderr, "[%s] failed to write() to %s:%u: %s\n",
-						fmtnow(nowbuf), self->ip, self->port,
-						(slen < 0 ? strerror(errno) : "uncomplete write"));
+				if (self->ctype != CON_UDP)
+					logerr("failed to write() to %s:%u: %s\n",
+							self->ip, self->port,
+							(slen < 0 ? strerror(errno) : "uncomplete write"));
 				close(self->fd);
 				self->fd = -1;
 				self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 				/* put back stuff we couldn't process */
 				for (; *metric != NULL; metric++) {
 					if (!queue_putback(self->queue, *metric)) {
-						fprintf(stderr, "server %s:%u: dropping metric: %s",
-								self->ip, self->port, *metric);
+						if (mode == DEBUG)
+							logerr("server %s:%u: dropping metric: %s",
+									self->ip, self->port, *metric);
 						free((char *)*metric);
 						self->dropped++;
 					}
 				}
 				break;
 			} else if (self->failure) {
-				fprintf(stderr, "[%s] server %s:%u: OK\n",
-						fmtnow(nowbuf), self->ip, self->port);
+				if (self->ctype != CON_UDP)
+					logerr("server %s:%u: OK\n", self->ip, self->port);
 				self->failure = 0;
 			}
 			free((char *)*metric);
@@ -363,6 +401,8 @@ server *
 server_new(
 		const char *ip,
 		unsigned short port,
+		serv_ctype ctype,
+		struct addrinfo *saddr,
 		size_t qsize,
 		size_t bsize)
 {
@@ -371,43 +411,20 @@ server_new(
 	if ((ret = malloc(sizeof(server))) == NULL)
 		return NULL;
 
-	ret->type = ORIGIN;
+	ret->ctype = ctype;
 	ret->tid = 0;
-	ret->next = NULL;
 	ret->secondaries = NULL;
 	ret->secondariescnt = 0;
 	ret->ip = strdup(ip);
 	ret->port = port;
+	ret->instance = NULL;
 	ret->bsize = bsize;
 	if ((ret->batch = malloc(sizeof(char *) * (bsize + 1))) == NULL) {
 		free(ret);
 		return NULL;
 	}
 	ret->fd = -1;
-	if (strcmp(ip, "internal") == 0) {
-		ret->type = INTERNAL;
-		ret->saddr = NULL;
-	} else {
-		struct addrinfo hint;
-		char sport[8];
-		int err;
-
-		memset(&hint, 0, sizeof(hint));
-
-		hint.ai_family = PF_UNSPEC;
-		hint.ai_socktype = SOCK_STREAM;
-		hint.ai_protocol = IPPROTO_TCP;
-		hint.ai_flags = AI_NUMERICSERV;
-		snprintf(sport, sizeof(sport), "%u", port);
-
-		if ((err = getaddrinfo(ip, sport, &hint, &(ret->saddr))) != 0) {
-			fprintf(stderr, "%s:%s: invalid host: %s\n",
-					ip, sport, gai_strerror(err));
-			free((char *)ret->ip);
-			free(ret);
-			return NULL;
-		}
-	}
+	ret->saddr = saddr;
 	ret->queue = queue_new(qsize);
 	if (ret->queue == NULL) {
 		free((char *)ret->ip);
@@ -420,6 +437,7 @@ server_new(
 	ret->keep_running = 1;
 	ret->metrics = 0;
 	ret->dropped = 0;
+	ret->stalls = 0;
 	ret->ticks = 0;
 
 	if (pthread_create(&ret->tid, NULL, &server_queuereader, ret) != 0) {
@@ -428,8 +446,6 @@ server_new(
 		return NULL;
 	}
 
-	ret->next = servers;
-	servers = ret;
 	return ret;
 }
 
@@ -444,6 +460,25 @@ server_add_secondaries(server *self, server **secondaries, size_t count)
 {
 	self->secondaries = secondaries;
 	self->secondariescnt = count;
+}
+
+/**
+ * Flags this server as part of a failover cluster, which means the
+ * secondaries are used only to offload on failure, not on queue stress.
+ */
+void
+server_set_failover(server *self)
+{
+	self->failover = 1;
+}
+
+/**
+ * Sets instance name only used for carbon_ch cluster type.
+ */
+void
+server_set_instance(server *self, char *instance)
+{
+	self->instance = strdup(instance);
 }
 
 /**
@@ -472,6 +507,7 @@ server_send(server *s, const char *d, char force)
 			s->dropped++;
 			/* excess event will be dropped by the enqueue below */
 		} else {
+			s->stalls++;
 			return 0;
 		}
 	}
@@ -481,25 +517,13 @@ server_send(server *s, const char *d, char force)
 }
 
 /**
- * Returns a NULL-terminated list of servers.
+ * Signals this server to stop whatever it's doing.
  */
-server **
-server_get_servers(void)
+void
+server_stop(server *s)
 {
-	size_t cnt = 0;
-	server *walk;
-	server **ret;
-
-	for (walk = servers; walk != NULL; walk = walk->next)
-		cnt++;
-
-	if ((ret = malloc(sizeof(server *) * (cnt + 1))) == NULL)
-		return NULL;
-	for (cnt = 0, walk = servers; walk != NULL; walk = walk->next, cnt++)
-		ret[cnt] = walk;
-	ret[cnt] = NULL;
-
-	return ret;
+	if (s->secondariescnt == 0)
+		s->keep_running = 0;
 }
 
 /**
@@ -536,7 +560,7 @@ server_shutdown(server *s)
 			/* loop until we all failed, or nothing is in the queues */
 		} while (failures != s->secondariescnt &&
 				inqueue != 0 &&
-				fprintf(stderr, "any_of cluster pending %zd metrics "
+				logerr("any_of cluster pending %zd metrics "
 					"(with %zd failed nodes)\n", inqueue, failures) >= -1 &&
 				usleep((200 + (rand() % 100)) * 1000) <= 0);
 		/* shut down entire cluster */
@@ -550,39 +574,23 @@ server_shutdown(server *s)
 
 	s->keep_running = 0;
 	if ((err = pthread_join(tid, NULL)) != 0)
-		fprintf(stderr, "%s:%u: failed to join server thread: %s\n",
+		logerr("%s:%u: failed to join server thread: %s\n",
 				s->ip, s->port, strerror(err));
 
-	if (s->type == ORIGIN) {
+	if (s->ctype == CON_TCP) {
 		size_t qlen = queue_len(s->queue);
 		queue_destroy(s->queue);
 		if (qlen > 0)
-			fprintf(stderr, "dropping %zd metrics for %s:%u\n",
+			logerr("dropping %zd metrics for %s:%u\n",
 					qlen, s->ip, s->port);
 	}
 	free(s->batch);
+	if (s->instance)
+		free(s->instance);
 	if (s->saddr != NULL)
 		freeaddrinfo(s->saddr);
 	free((char *)s->ip);
 	s->ip = NULL;
-}
-
-/**
- * Waits for all servers to be shut down.  This is a small optimisation
- * over looping over server_shutdown for it tries to speed up the
- * waiting time by shutting down in parallel as many servers as
- * possible.
- */
-void
-server_shutdown_all(void)
-{
-	server *walk;
-
-	for (walk = servers; walk != NULL; walk = walk->next)
-		if (walk->secondariescnt == 0)
-			walk->keep_running = 0;
-	for (walk = servers; walk != NULL; walk = walk->next)
-		server_shutdown(walk);
 }
 
 /**
@@ -608,6 +616,26 @@ server_port(server *s)
 }
 
 /**
+ * Returns the instance associated with this server.
+ */
+inline char *
+server_instance(server *s)
+{
+	return s->instance;
+}
+
+/**
+ * Returns the connection type of this server.
+ */
+inline serv_ctype
+server_ctype(server *s)
+{
+	if (s == NULL)
+		return CON_PIPE;
+	return s->ctype;
+}
+
+/**
  * Returns whether the last action on this server caused a failure.
  */
 inline char
@@ -619,7 +647,7 @@ server_failed(server *s)
 }
 
 /**
- * Returns the wall-clock time in milliseconds consumed sending metrics.
+ * Returns the wall-clock time in microseconds (us) consumed sending metrics.
  */
 inline size_t
 server_get_ticks(server *s)
@@ -652,6 +680,19 @@ server_get_dropped(server *s)
 }
 
 /**
+ * Returns the number of stalls since start.  A stall happens when the
+ * queue is full, but it appears as if it would be a good idea to wait
+ * for a brief period and retry.
+ */
+inline size_t
+server_get_stalls(server *s)
+{
+	if (s == NULL)
+		return 0;
+	return s->stalls;
+}
+
+/**
  * Returns the (approximate) number of metrics waiting to be sent.
  */
 inline size_t
@@ -660,4 +701,16 @@ server_get_queue_len(server *s)
 	if (s == NULL)
 		return 0;
 	return queue_len(s->queue);
+}
+
+/**
+ * Returns the allocated size of the queue backing metrics waiting to be
+ * sent.
+ */
+inline size_t
+server_get_queue_size(server *s)
+{
+	if (s == NULL)
+		return 0;
+	return queue_size(s->queue);
 }
