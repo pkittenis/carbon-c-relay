@@ -28,7 +28,7 @@ endif
 # should be accepted sort of anywhere
 MATH_LIBS = -lm
 
-override LIBS += $(SOCKET_LIBS) $(MATH_LIBS) -pthread
+override LIBS += $(SOCKET_LIBS) $(MATH_LIBS) -pthread -lz
 
 OBJS = \
 	relay.o \

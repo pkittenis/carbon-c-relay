@@ -29,6 +29,7 @@
 #include <sys/resource.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <zlib.h>
 
 #include "relay.h"
 #include "router.h"
@@ -164,6 +165,8 @@ dispatch_removelistener(int sock)
 }
 
 #define CONNGROWSZ  1024
+#define CHUNK 16384
+
 
 /**
  * Adds a connection socket to the chain of connections.
@@ -343,6 +346,14 @@ dispatch_connection(connection *conn, dispatcher *self)
 	char *p, *q, *firstspace, *lastnl;
 	int len;
 	struct timeval start, stop;
+	z_stream strm;
+	strm.zalloc = Z_NULL;
+	strm.zfree = Z_NULL;
+	strm.opaque = Z_NULL;
+	int ret;
+	ret = inflateInit(&strm);
+	if (ret != Z_OK)
+	  return ret;
 
 	gettimeofday(&start, NULL);
 	/* first try to resume any work being blocked */
@@ -374,6 +385,8 @@ dispatch_connection(connection *conn, dispatcher *self)
 						(sizeof(conn->buf) - 1) - conn->buflen)) > 0
 	   )
 	{
+	        /* allocate deflate state */
+		strm.avail_in = conn->buflen;
 		if (len > 0)
 			conn->buflen += len;
 
