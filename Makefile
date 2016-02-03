@@ -45,6 +45,8 @@ OBJS = \
 relay: $(OBJS)
 	$(CC) -o $@ $(LDFLAGS) $^ $(LIBS)
 
+all: relay
+
 VERSION = $(shell sed -n '/VERSION/s/^.*"\([0-9.]\+\)".*$$/\1/p' relay.h)
 dist:
 	git archive \
