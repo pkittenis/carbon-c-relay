@@ -350,11 +350,8 @@ dispatch_connection(connection *conn, dispatcher *self)
 	strm.zalloc = Z_NULL;
 	strm.zfree = Z_NULL;
 	strm.opaque = Z_NULL;
-	int ret;
-	ret = inflateInit(&strm);
-	if (ret != Z_OK)
-	  return ret;
-
+	if (inflateInit(&strm) != Z_OK)
+	  return 1;
 	gettimeofday(&start, NULL);
 	/* first try to resume any work being blocked */
 	if (dispatch_process_dests(conn, self, start) == 0) {
@@ -385,11 +382,18 @@ dispatch_connection(connection *conn, dispatcher *self)
 						(sizeof(conn->buf) - 1) - conn->buflen)) > 0
 	   )
 	{
-	        /* allocate deflate state */
-		strm.avail_in = conn->buflen;
+		
 		if (len > 0)
 			conn->buflen += len;
-
+		// unsigned char in[CHUNK];
+		strm.avail_in = conn->buflen;
+		strm.next_in = (unsigned char)conn->buf;
+		if (inflate(&strm, Z_NO_FLUSH) == Z_STREAM_ERROR)
+		  return 1;
+		(void)inflateEnd(&strm);
+		// conn->buf = strm.next_out;
+		// conn->buf = inflate_conn_buff(conn);
+		// conn->buf;
 		/* metrics look like this: metric_path value timestamp\n
 		 * due to various messups we need to sanitise the
 		 * metrics_path here, to ensure we can calculate the metric
