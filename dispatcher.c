@@ -297,9 +297,23 @@ dispatch_process_dests(connection *conn, dispatcher *self, struct timeval now)
 {
 	int i;
 	char force = timediff(conn->lastwork, now) > 1 * 1000 * 1000;  /* 1 sec timeout */
+	char comp_out[METRIC_BUFSIZ];
+	z_stream strm;
+	strm.zalloc = Z_NULL;
+	strm.zfree = Z_NULL;
+	strm.opaque = Z_NULL;
+	strm.avail_in = sizeof(conn->metric);
+	strm.next_in = (Bytef *)conn->metric;
+	strm.avail_out = (uInt)sizeof(comp_out);
+	strm.next_out = (Bytef *) comp_out;
 
 	if (conn->destlen > 0) {
 		for (i = 0; i < conn->destlen; i++) {
+		  deflateInit(&strm, Z_DEFAULT_COMPRESSION);
+		  deflate(&strm, Z_FINISH);
+		  deflateEnd(&strm);
+		  printf("Deflated size is: %lu\n", (char*)strm.next_out - comp_out);
+
 			if (server_send(conn->dests[i].dest, conn->dests[i].metric, force) == 0)
 				break;
 		}
@@ -346,12 +360,11 @@ dispatch_connection(connection *conn, dispatcher *self)
 	char *p, *q, *firstspace, *lastnl;
 	int len;
 	struct timeval start, stop;
+	char decomp_out[METRIC_BUFSIZ];
 	z_stream strm;
 	strm.zalloc = Z_NULL;
 	strm.zfree = Z_NULL;
 	strm.opaque = Z_NULL;
-	if (inflateInit(&strm) != Z_OK)
-	  return 1;
 	gettimeofday(&start, NULL);
 	/* first try to resume any work being blocked */
 	if (dispatch_process_dests(conn, self, start) == 0) {
@@ -387,10 +400,19 @@ dispatch_connection(connection *conn, dispatcher *self)
 			conn->buflen += len;
 		// unsigned char in[CHUNK];
 		strm.avail_in = conn->buflen;
-		strm.next_in = (unsigned char)conn->buf;
-		if (inflate(&strm, Z_NO_FLUSH) == Z_STREAM_ERROR)
-		  return 1;
-		(void)inflateEnd(&strm);
+		strm.next_in = (Bytef *)conn->buf;
+		strm.avail_out = (uInt)sizeof(decomp_out);
+		strm.next_out = (Bytef *) decomp_out;
+		// deflateInit(&strm, Z_DEFAULT_COMPRESSION);
+		// deflate(&strm, Z_FINISH);
+		// deflateEnd(&strm);
+		inflateInit(&strm);
+		inflate(&strm, Z_NO_FLUSH);
+		inflateEnd(&strm);
+		// printf("Inflated size is: %lu\n", (char*)strm.next_out - decomp_out);
+		/* if (inflate(&strm, Z_NO_FLUSH) == Z_STREAM_ERROR) */
+		/*   return 1; */
+		// (void)inflateEnd(&strm);
 		// conn->buf = strm.next_out;
 		// conn->buf = inflate_conn_buff(conn);
 		// conn->buf;
@@ -399,7 +421,9 @@ dispatch_connection(connection *conn, dispatcher *self)
 		 * metrics_path here, to ensure we can calculate the metric
 		 * name off the filesystem path (and actually retrieve it in
 		 * the web interface). */
+		// uncompress(
 		q = conn->metric;
+		
 		firstspace = NULL;
 		lastnl = NULL;
 		for (p = conn->buf; p - conn->buf < conn->buflen; p++) {
